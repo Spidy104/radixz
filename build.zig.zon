@@ -1,0 +1,7 @@
+.{
+    .name = .radixz,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md", "API.md", "BENCHMARKS.md", "LICENSE" },
+    .fingerprint = 0xf70ea8b3da48d8d2,
+}
