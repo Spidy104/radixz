@@ -1,5 +1,11 @@
 const std = @import("std");
 
+fn disjoint(a: anytype, b: anytype) bool {
+    const a0 = @intFromPtr(a.ptr);
+    const b0 = @intFromPtr(b.ptr);
+    return a0 + a.len * @sizeOf(std.meta.Elem(@TypeOf(a))) <= b0 or b0 + b.len * @sizeOf(std.meta.Elem(@TypeOf(b))) <= a0;
+}
+
 pub fn Fft(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -43,6 +49,7 @@ pub fn Fft(comptime T: type) type {
 
         pub fn forward(self: *const Self, re: []T, im: []T, scratch: []T) void {
             std.debug.assert(re.len == self.n and im.len == self.n and scratch.len >= 2 * self.n);
+            std.debug.assert(disjoint(re, im) and disjoint(re, scratch) and disjoint(im, scratch));
             if (codelet(false, self.n, re, im)) return;
             if (self.n < span) {
                 self.scalar(false, re, im);
@@ -59,6 +66,7 @@ pub fn Fft(comptime T: type) type {
 
         pub fn inverse(self: *const Self, re: []T, im: []T, scratch: []T) void {
             std.debug.assert(re.len == self.n and im.len == self.n and scratch.len >= 2 * self.n);
+            std.debug.assert(disjoint(re, im) and disjoint(re, scratch) and disjoint(im, scratch));
             if (codelet(true, self.n, re, im)) return;
             if (self.n < span) {
                 self.bitReverse(re, im);
@@ -90,6 +98,7 @@ pub fn Fft(comptime T: type) type {
         fn complexRun(self: *const Self, comptime inv: bool, z: []Complex, scratch: []T) void {
             const n = self.n;
             std.debug.assert(z.len == n and scratch.len >= 4 * n);
+            std.debug.assert(disjoint(z, scratch));
             const x: []T = std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(z));
             const w: Work = .{ .re = scratch[0..n], .im = scratch[n .. 2 * n] };
             if (n >= self.fused_min and self.bigStages() > 0) {
@@ -470,39 +479,13 @@ pub fn Fft(comptime T: type) type {
             return s[i..][0..lanes].*;
         }
 
-        const even_mask: Mask = blk: {
-            var a: [lanes]i32 = undefined;
-            for (0..lanes) |i| a[i] = if (2 * i < lanes) @intCast(2 * i) else ~@as(i32, @intCast(2 * i - lanes));
-            break :blk a;
-        };
-
-        const odd_mask: Mask = blk: {
-            var a: [lanes]i32 = undefined;
-            for (0..lanes) |i| a[i] = if (2 * i + 1 < lanes) @intCast(2 * i + 1) else ~@as(i32, @intCast(2 * i + 1 - lanes));
-            break :blk a;
-        };
-
         fn ldSplit(x: []const T, i: usize) [2]V {
-            const a: V = x[2 * i ..][0..lanes].*;
-            const b: V = x[2 * i + lanes ..][0..lanes].*;
-            return .{ @shuffle(T, a, b, even_mask), @shuffle(T, a, b, odd_mask) };
+            const v: @Vector(2 * lanes, T) = x[2 * i ..][0 .. 2 * lanes].*;
+            return std.simd.deinterlace(2, v);
         }
 
-        const lo_mask: Mask = blk: {
-            var a: [lanes]i32 = undefined;
-            for (0..lanes) |i| a[i] = if (i % 2 == 0) @intCast(i / 2) else ~@as(i32, @intCast(i / 2));
-            break :blk a;
-        };
-
-        const hi_mask: Mask = blk: {
-            var a: [lanes]i32 = undefined;
-            for (0..lanes) |i| a[i] = if (i % 2 == 0) @intCast(lanes / 2 + i / 2) else ~@as(i32, @intCast(lanes / 2 + i / 2));
-            break :blk a;
-        };
-
         fn stMerge(x: []T, i: usize, a: V, b: V) void {
-            x[2 * i ..][0..lanes].* = @shuffle(T, a, b, lo_mask);
-            x[2 * i + lanes ..][0..lanes].* = @shuffle(T, a, b, hi_mask);
+            x[2 * i ..][0 .. 2 * lanes].* = std.simd.interlace(.{ a, b });
         }
 
         fn st(s: []T, i: usize, v: V) void {
@@ -897,12 +880,12 @@ pub fn Conv(comptime T: type) type {
         }
 
         pub fn filter(self: *const Self, x: []const T, y: []T) void {
-            std.debug.assert(y.len == x.len);
+            std.debug.assert(y.len == x.len and disjoint(x, y));
             self.range(self.work(0), x, y, 0, self.pairs(x.len));
         }
 
         pub fn filterParallel(self: *const Self, io: std.Io, x: []const T, y: []T) (std.Io.ConcurrentError || std.Io.Cancelable)!void {
-            std.debug.assert(y.len == x.len);
+            std.debug.assert(y.len == x.len and disjoint(x, y));
             const p = self.pairs(x.len);
             const t = @min(self.workers, p);
             if (t <= 1) return self.filter(x, y);
@@ -995,6 +978,7 @@ pub fn Conv(comptime T: type) type {
 }
 
 pub fn StaticFft(comptime T: type, comptime n: usize) type {
+    if (n < 2 or !std.math.isPowerOfTwo(n)) @compileError("StaticFft size must be a power of two and at least 2");
     return struct {
         const F = Fft(T);
         const table: [2 * n]T = blk: {
@@ -1030,7 +1014,6 @@ pub fn Rfft(comptime T: type) type {
         const F = Fft(T);
         const lanes = F.lanes;
         const V = F.V;
-        const M = F.Mask;
 
         n: usize,
         half: F,
@@ -1059,6 +1042,7 @@ pub fn Rfft(comptime T: type) type {
         pub fn forward(self: *const Self, x: []const T, re: []T, im: []T, scratch: []T) void {
             const m = self.n / 2;
             std.debug.assert(x.len == self.n and re.len == m + 1 and im.len == m + 1 and scratch.len >= self.n);
+            std.debug.assert(disjoint(x, re) and disjoint(x, im) and disjoint(re, im) and disjoint(x, scratch) and disjoint(re, scratch) and disjoint(im, scratch));
             if (self.n == 2) {
                 re[0] = x[0] + x[1];
                 re[1] = x[0] - x[1];
@@ -1106,6 +1090,7 @@ pub fn Rfft(comptime T: type) type {
         pub fn inverse(self: *const Self, re: []T, im: []T, x: []T, scratch: []T) void {
             const m = self.n / 2;
             std.debug.assert(x.len == self.n and re.len == m + 1 and im.len == m + 1 and scratch.len >= self.n);
+            std.debug.assert(disjoint(x, re) and disjoint(x, im) and disjoint(re, im) and disjoint(x, scratch) and disjoint(re, scratch) and disjoint(im, scratch));
             if (self.n == 2) {
                 x[0] = re[0] + re[1];
                 x[1] = re[0] - re[1];
@@ -1134,15 +1119,15 @@ pub fn Rfft(comptime T: type) type {
                 const j = m - k - lanes + 1;
                 const ar: V = re[k..][0..lanes].*;
                 const ai: V = im[k..][0..lanes].*;
-                const br = rev(re[j..][0..lanes].*);
-                const bi = rev(im[j..][0..lanes].*);
+                const br = std.simd.reverseOrder(@as(V, re[j..][0..lanes].*));
+                const bi = std.simd.reverseOrder(@as(V, im[j..][0..lanes].*));
                 const wr: V = self.wr[k..][0..lanes].*;
                 const wi: V = self.wi[k..][0..lanes].*;
                 const o = pair(V, inv, ar, ai, br, bi, wr, wi * @as(V, @splat(sgn)));
                 re[k..][0..lanes].* = o[0];
                 im[k..][0..lanes].* = o[1];
-                re[j..][0..lanes].* = rev(o[2]);
-                im[j..][0..lanes].* = rev(o[3]);
+                re[j..][0..lanes].* = std.simd.reverseOrder(o[2]);
+                im[j..][0..lanes].* = std.simd.reverseOrder(o[3]);
             }
             while (k <= m / 2) : (k += 1) {
                 const o = pair(T, inv, re[k], im[k], re[m - k], im[m - k], self.wr[k], sgn * self.wi[k]);
@@ -1167,15 +1152,6 @@ pub fn Rfft(comptime T: type) type {
             const tr = (di * wr + dr * wi) * half;
             const ti = (di * wi - dr * wr) * half;
             return .{ er * half + tr, ei * half + ti, er * half - tr, -(ei * half - ti) };
-        }
-
-        fn rev(v: V) V {
-            const mask: M = comptime blk: {
-                var a: [lanes]i32 = undefined;
-                for (0..lanes) |i| a[i] = @intCast(lanes - 1 - i);
-                break :blk a;
-            };
-            return @shuffle(T, v, undefined, mask);
         }
     };
 }

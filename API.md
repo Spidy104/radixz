@@ -26,8 +26,9 @@ and keep slices into it, so the buffer must outlive the plan. Plans are small st
 slices and can be copied freely. Buffers passed to `init` must be 64-byte aligned
 (`gpa.alignedAlloc(T, .@"64", len)`); data and scratch slices have no alignment requirement.
 
-**Checks.** Contract violations are `std.debug.assert`s: caught in Debug and ReleaseSafe,
-undefined behaviour in ReleaseFast.
+**Checks.** Contract violations (wrong lengths, overlapping slices where the docs say they
+must not overlap) are `std.debug.assert`s: caught in Debug and ReleaseSafe, undefined
+behaviour in ReleaseFast.
 
 ---
 
@@ -182,7 +183,7 @@ Same definition and scaling as `Fft(T)`. Thread-safe: no shared mutable state.
 
 Notes:
 
-- `n >= 2`, power of two.
+- `n >= 2`, power of two. Anything else is a compile error.
 - Up to `n = 256` for `f32` and `n = 64` for `f64`, both `StaticFft` and `Fft` run the same
   fully unrolled register code, so they are equally fast there. Above that `StaticFft` does
   an in-place bit reversal instead of the fused reordering `Fft` uses, and is slower.
