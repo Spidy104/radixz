@@ -54,7 +54,7 @@ pub fn Fft(comptime T: type) type {
                 return self.slotPermute(false, re, im, w);
             }
             self.bigForward(w, re, im);
-            self.permutedOut(w, re, im);
+            self.permutedOut(false, w, re, im);
         }
 
         pub fn inverse(self: *const Self, re: []T, im: []T, scratch: []T) void {
@@ -69,8 +69,64 @@ pub fn Fft(comptime T: type) type {
                 self.slotPermute(true, re, im, w);
                 return self.inverseScrambled(re, im);
             }
-            self.permutedIn(re, im, w);
+            self.permutedIn(false, re, im, w);
             self.bigInverse(w, true, re, im, 0);
+        }
+
+        pub const Complex = std.math.Complex(T);
+
+        comptime {
+            std.debug.assert(@sizeOf(Complex) == 2 * @sizeOf(T) and @offsetOf(Complex, "re") == 0 and @offsetOf(Complex, "im") == @sizeOf(T));
+        }
+
+        pub fn forwardComplex(self: *const Self, z: []Complex, scratch: []T) void {
+            self.complexRun(false, z, scratch);
+        }
+
+        pub fn inverseComplex(self: *const Self, z: []Complex, scratch: []T) void {
+            self.complexRun(true, z, scratch);
+        }
+
+        fn complexRun(self: *const Self, comptime inv: bool, z: []Complex, scratch: []T) void {
+            const n = self.n;
+            std.debug.assert(z.len == n and scratch.len >= 4 * n);
+            const x: []T = std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(z));
+            const w: Work = .{ .re = scratch[0..n], .im = scratch[n .. 2 * n] };
+            if (n >= self.fused_min and self.bigStages() > 0) {
+                if (inv) {
+                    self.permutedIn(true, x, x, w);
+                    self.bigInverseInterleaved(w, x);
+                } else {
+                    self.bigForwardInterleaved(w, x);
+                    self.permutedOut(true, w, x, x);
+                }
+                return;
+            }
+            deinterleave(x, w.re, w.im);
+            if (inv) self.inverse(w.re, w.im, scratch[2 * n ..]) else self.forward(w.re, w.im, scratch[2 * n ..]);
+            interleave(w.re, w.im, x);
+        }
+
+        fn deinterleave(x: []const T, re: []T, im: []T) void {
+            var k: usize = 0;
+            while (k + lanes <= re.len) : (k += lanes) {
+                const p = ldSplit(x, k);
+                re[k..][0..lanes].* = p[0];
+                im[k..][0..lanes].* = p[1];
+            }
+            while (k < re.len) : (k += 1) {
+                re[k] = x[2 * k];
+                im[k] = x[2 * k + 1];
+            }
+        }
+
+        fn interleave(re: []const T, im: []const T, x: []T) void {
+            var k: usize = 0;
+            while (k + lanes <= re.len) : (k += lanes) stMerge(x, k, re[k..][0..lanes].*, im[k..][0..lanes].*);
+            while (k < re.len) : (k += 1) {
+                x[2 * k] = re[k];
+                x[2 * k + 1] = im[k];
+            }
         }
 
         const rev_span: [span]usize = blk: {
@@ -86,7 +142,7 @@ pub fn Fft(comptime T: type) type {
 
         const line = lanes;
 
-        fn permutedOut(self: *const Self, w: Work, re: []T, im: []T) void {
+        fn permutedOut(self: *const Self, comptime il: bool, w: Work, re: []T, im: []T) void {
             const cols = self.n / span;
             const cb = std.math.log2_int(usize, cols);
             var tr: [line][vecs]V = undefined;
@@ -112,14 +168,18 @@ pub fn Fft(comptime T: type) type {
                     transpose(&vi);
                     smallStages(false, lanes, &vr, &vi);
                     inline for (0..lanes) |t| {
-                        st(re, rev_span[q * lanes + t] * cols + c, vr[t]);
-                        st(im, rev_span[q * lanes + t] * cols + c, vi[t]);
+                        if (il) {
+                            stMerge(re, rev_span[q * lanes + t] * cols + c, vr[t], vi[t]);
+                        } else {
+                            st(re, rev_span[q * lanes + t] * cols + c, vr[t]);
+                            st(im, rev_span[q * lanes + t] * cols + c, vi[t]);
+                        }
                     }
                 }
             }
         }
 
-        fn permutedIn(self: *const Self, re: []const T, im: []const T, w: Work) void {
+        fn permutedIn(self: *const Self, comptime il: bool, re: []const T, im: []const T, w: Work) void {
             const cols = self.n / span;
             const cb = std.math.log2_int(usize, cols);
             var tr: [line][vecs]V = undefined;
@@ -130,8 +190,14 @@ pub fn Fft(comptime T: type) type {
                     var vr: [lanes]V = undefined;
                     var vi: [lanes]V = undefined;
                     inline for (0..lanes) |t| {
-                        vr[t] = ld(re, rev_span[q * lanes + t] * cols + c);
-                        vi[t] = ld(im, rev_span[q * lanes + t] * cols + c);
+                        if (il) {
+                            const p = ldSplit(re, rev_span[q * lanes + t] * cols + c);
+                            vr[t] = p[0];
+                            vi[t] = p[1];
+                        } else {
+                            vr[t] = ld(re, rev_span[q * lanes + t] * cols + c);
+                            vi[t] = ld(im, rev_span[q * lanes + t] * cols + c);
+                        }
                     }
                     smallStages(true, lanes, &vr, &vi);
                     transpose(&vr);
@@ -404,6 +470,41 @@ pub fn Fft(comptime T: type) type {
             return s[i..][0..lanes].*;
         }
 
+        const even_mask: Mask = blk: {
+            var a: [lanes]i32 = undefined;
+            for (0..lanes) |i| a[i] = if (2 * i < lanes) @intCast(2 * i) else ~@as(i32, @intCast(2 * i - lanes));
+            break :blk a;
+        };
+
+        const odd_mask: Mask = blk: {
+            var a: [lanes]i32 = undefined;
+            for (0..lanes) |i| a[i] = if (2 * i + 1 < lanes) @intCast(2 * i + 1) else ~@as(i32, @intCast(2 * i + 1 - lanes));
+            break :blk a;
+        };
+
+        fn ldSplit(x: []const T, i: usize) [2]V {
+            const a: V = x[2 * i ..][0..lanes].*;
+            const b: V = x[2 * i + lanes ..][0..lanes].*;
+            return .{ @shuffle(T, a, b, even_mask), @shuffle(T, a, b, odd_mask) };
+        }
+
+        const lo_mask: Mask = blk: {
+            var a: [lanes]i32 = undefined;
+            for (0..lanes) |i| a[i] = if (i % 2 == 0) @intCast(i / 2) else ~@as(i32, @intCast(i / 2));
+            break :blk a;
+        };
+
+        const hi_mask: Mask = blk: {
+            var a: [lanes]i32 = undefined;
+            for (0..lanes) |i| a[i] = if (i % 2 == 0) @intCast(lanes / 2 + i / 2) else ~@as(i32, @intCast(lanes / 2 + i / 2));
+            break :blk a;
+        };
+
+        fn stMerge(x: []T, i: usize, a: V, b: V) void {
+            x[2 * i ..][0..lanes].* = @shuffle(T, a, b, lo_mask);
+            x[2 * i + lanes ..][0..lanes].* = @shuffle(T, a, b, hi_mask);
+        }
+
         fn st(s: []T, i: usize, v: V) void {
             s[i..][0..lanes].* = v;
         }
@@ -425,43 +526,50 @@ pub fn Fft(comptime T: type) type {
                 }
                 return;
             }
-            self.fwdBlock(w, sr, si, 0, self.n, rem);
+            self.fwdBlock(w, false, sr, si, 0, self.n, rem);
         }
 
-        fn fwdBlock(self: *const Self, w: Work, sr: []const T, si: []const T, lo: usize, size: usize, rem: usize) void {
-            var r = sr;
-            var m = si;
+        fn bigForwardInterleaved(self: *const Self, w: Work, x: []const T) void {
+            self.fwdBlock(w, true, x, x, 0, self.n, self.bigStages());
+        }
+
+        fn fwdBlock(self: *const Self, w: Work, comptime il: bool, sr: []const T, si: []const T, lo: usize, size: usize, rem: usize) void {
             var top = size / 2;
             var left = rem;
+            if (left == 0) return;
+            const g0 = group(left);
+            const q0 = top >> @intCast(g0 - 1);
+            self.pass(w, false, il, g0, q0, sr, si, lo, lo + size, false, &.{}, &.{}, 0);
             if (size > self.block and left > group_max) {
-                const g = group(left);
-                const q = top >> @intCast(g - 1);
-                self.pass(w, false, g, q, r, m, lo, lo + size, false, &.{}, &.{}, 0);
-                const sub = size >> @intCast(g);
-                for (0..@as(usize, 1) << @intCast(g)) |k| self.fwdBlock(w, w.re, w.im, lo + k * sub, sub, left - g);
+                const sub = size >> @intCast(g0);
+                for (0..@as(usize, 1) << @intCast(g0)) |k| self.fwdBlock(w, false, w.re, w.im, lo + k * sub, sub, left - g0);
                 return;
             }
+            top = q0 / 2;
+            left -= g0;
             while (left > 0) {
                 const g = group(left);
                 const q = top >> @intCast(g - 1);
-                self.pass(w, false, g, q, r, m, lo, lo + size, false, &.{}, &.{}, 0);
-                r = w.re;
-                m = w.im;
+                self.pass(w, false, false, g, q, w.re, w.im, lo, lo + size, false, &.{}, &.{}, 0);
                 top = q / 2;
                 left -= g;
             }
         }
 
         fn bigInverse(self: *const Self, w: Work, comptime to_y: bool, yr: []T, yi: []T, skip: usize) void {
-            self.invBlock(w, to_y, yr, yi, skip, 0, self.n, self.bigStages());
+            self.invBlock(w, to_y, false, yr, yi, skip, 0, self.n, self.bigStages());
         }
 
-        fn invBlock(self: *const Self, w: Work, comptime to_y: bool, yr: []T, yi: []T, skip: usize, lo: usize, size: usize, rem: usize) void {
+        fn bigInverseInterleaved(self: *const Self, w: Work, x: []T) void {
+            self.invBlock(w, true, true, x, x, 0, 0, self.n, self.bigStages());
+        }
+
+        fn invBlock(self: *const Self, w: Work, comptime to_y: bool, comptime il: bool, yr: []T, yi: []T, skip: usize, lo: usize, size: usize, rem: usize) void {
             if (size > self.block and rem > group_max) {
                 const g = group(rem);
                 const sub = size >> @intCast(g);
-                for (0..@as(usize, 1) << @intCast(g)) |k| self.invBlock(w, false, &.{}, &.{}, 0, lo + k * sub, sub, rem - g);
-                self.pass(w, true, g, sub, w.re, w.im, lo, lo + size, to_y, yr, yi, skip);
+                for (0..@as(usize, 1) << @intCast(g)) |k| self.invBlock(w, false, false, &.{}, &.{}, 0, lo + k * sub, sub, rem - g);
+                self.pass(w, true, il, g, sub, w.re, w.im, lo, lo + size, to_y, yr, yi, skip);
                 return;
             }
             var left = rem;
@@ -470,16 +578,16 @@ pub fn Fft(comptime T: type) type {
                 const g: usize = if (left % group_max != 0) left % group_max else group_max;
                 left -= g;
                 if (to_y and left == 0)
-                    self.pass(w, true, g, q, w.re, w.im, lo, lo + size, true, yr, yi, skip)
+                    self.pass(w, true, il, g, q, w.re, w.im, lo, lo + size, true, yr, yi, skip)
                 else
-                    self.pass(w, true, g, q, w.re, w.im, lo, lo + size, false, &.{}, &.{}, 0);
+                    self.pass(w, true, false, g, q, w.re, w.im, lo, lo + size, false, &.{}, &.{}, 0);
                 q <<= @intCast(g);
             }
         }
 
-        fn pass(self: *const Self, w: Work, comptime inv: bool, g: usize, q: usize, sr: []const T, si: []const T, lo: usize, hi: usize, comptime to_y: bool, yr: []T, yi: []T, skip: usize) void {
+        fn pass(self: *const Self, w: Work, comptime inv: bool, comptime il: bool, g: usize, q: usize, sr: []const T, si: []const T, lo: usize, hi: usize, comptime to_y: bool, yr: []T, yi: []T, skip: usize) void {
             switch (g) {
-                inline 1...group_max => |c| self.passN(w, inv, c, q, sr, si, lo, hi, to_y, yr, yi, skip),
+                inline 1...group_max => |c| self.passN(w, inv, il, c, q, sr, si, lo, hi, to_y, yr, yi, skip),
                 else => unreachable,
             }
         }
@@ -495,7 +603,7 @@ pub fn Fft(comptime T: type) type {
             return .{ ld(self.twr, h + j), ld(self.twi, h + j) };
         }
 
-        fn passN(self: *const Self, w: Work, comptime inv: bool, comptime s: usize, q: usize, sr: []const T, si: []const T, lo: usize, hi: usize, comptime to_y: bool, yr: []T, yi: []T, skip: usize) void {
+        fn passN(self: *const Self, w: Work, comptime inv: bool, comptime il: bool, comptime s: usize, q: usize, sr: []const T, si: []const T, lo: usize, hi: usize, comptime to_y: bool, yr: []T, yi: []T, skip: usize) void {
             const g = 1 << s;
             var i = lo;
             while (i < hi) : (i += g * q) {
@@ -504,8 +612,14 @@ pub fn Fft(comptime T: type) type {
                     var r: [g]V = undefined;
                     var m: [g]V = undefined;
                     inline for (0..g) |k| {
-                        r[k] = ld(sr, i + j + k * q);
-                        m[k] = ld(si, i + j + k * q);
+                        if (il and !inv) {
+                            const p = ldSplit(sr, i + j + k * q);
+                            r[k] = p[0];
+                            m[k] = p[1];
+                        } else {
+                            r[k] = ld(sr, i + j + k * q);
+                            m[k] = ld(si, i + j + k * q);
+                        }
                     }
                     if (s == 2) {
                         const w2 = self.tw(2 * q, j);
@@ -535,7 +649,9 @@ pub fn Fft(comptime T: type) type {
                         }
                     }
                     inline for (0..g) |k| {
-                        if (to_y) {
+                        if (to_y and il) {
+                            stMerge(yr, i + j + k * q, r[k], m[k]);
+                        } else if (to_y) {
                             put(yr, skip, i + j + k * q, r[k]);
                             put(yi, skip, i + j + k * q, m[k]);
                         } else {
@@ -904,6 +1020,162 @@ pub fn StaticFft(comptime T: type, comptime n: usize) type {
 
         pub fn inverse(re: *[n]T, im: *[n]T) void {
             plan.inPlace(true, re, im);
+        }
+    };
+}
+
+pub fn Rfft(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const F = Fft(T);
+        const lanes = F.lanes;
+        const V = F.V;
+        const M = F.Mask;
+
+        n: usize,
+        half: F,
+        wr: []const T,
+        wi: []const T,
+
+        pub fn bufferLen(n: usize) usize {
+            return if (n < 4) 0 else F.bufferLen(n / 2) + n;
+        }
+
+        pub fn init(buf: []align(64) T, n: usize) Self {
+            std.debug.assert(std.math.isPowerOfTwo(n) and n >= 2 and buf.len >= bufferLen(n));
+            if (n < 4) return .{ .n = n, .half = undefined, .wr = &.{}, .wi = &.{} };
+            const m = n / 2;
+            const f0 = F.bufferLen(m);
+            const wr = buf[f0..][0..m];
+            const wi = buf[f0 + m ..][0..m];
+            for (wr, wi, 0..) |*a, *b, k| {
+                const ang = -2 * std.math.pi * @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(n));
+                a.* = @floatCast(@cos(ang));
+                b.* = @floatCast(@sin(ang));
+            }
+            return .{ .n = n, .half = F.init(buf[0..f0], m), .wr = wr, .wi = wi };
+        }
+
+        pub fn forward(self: *const Self, x: []const T, re: []T, im: []T, scratch: []T) void {
+            const m = self.n / 2;
+            std.debug.assert(x.len == self.n and re.len == m + 1 and im.len == m + 1 and scratch.len >= self.n);
+            if (self.n == 2) {
+                re[0] = x[0] + x[1];
+                re[1] = x[0] - x[1];
+                im[0] = 0;
+                im[1] = 0;
+                return;
+            }
+            if (m >= self.half.fused_min and self.half.bigStages() > 0) {
+                const w: F.Work = .{ .re = scratch[0..m], .im = scratch[m..][0..m] };
+                self.half.bigForwardInterleaved(w, x);
+                self.half.permutedOut(false, w, re[0..m], im[0..m]);
+            } else {
+                F.deinterleave(x, re[0..m], im[0..m]);
+                self.half.forward(re[0..m], im[0..m], scratch);
+            }
+            const z0r = re[0];
+            const z0i = im[0];
+            re[0] = z0r + z0i;
+            im[0] = 0;
+            re[m] = z0r - z0i;
+            im[m] = 0;
+            self.untangle(false, re, im);
+        }
+
+        pub const Complex = F.Complex;
+
+        pub fn forwardComplex(self: *const Self, x: []const T, out: []Complex, scratch: []T) void {
+            const m = self.n / 2;
+            std.debug.assert(out.len == m + 1 and scratch.len >= 2 * self.n + 2);
+            const re = scratch[0 .. m + 1];
+            const im = scratch[m + 1 ..][0 .. m + 1];
+            self.forward(x, re, im, scratch[2 * m + 2 ..][0..self.n]);
+            F.interleave(re, im, std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(out)));
+        }
+
+        pub fn inverseComplex(self: *const Self, in: []const Complex, x: []T, scratch: []T) void {
+            const m = self.n / 2;
+            std.debug.assert(in.len == m + 1 and scratch.len >= 2 * self.n + 2);
+            const re = scratch[0 .. m + 1];
+            const im = scratch[m + 1 ..][0 .. m + 1];
+            F.deinterleave(std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(in)), re, im);
+            self.inverse(re, im, x, scratch[2 * m + 2 ..][0..self.n]);
+        }
+
+        pub fn inverse(self: *const Self, re: []T, im: []T, x: []T, scratch: []T) void {
+            const m = self.n / 2;
+            std.debug.assert(x.len == self.n and re.len == m + 1 and im.len == m + 1 and scratch.len >= self.n);
+            if (self.n == 2) {
+                x[0] = re[0] + re[1];
+                x[1] = re[0] - re[1];
+                return;
+            }
+            const x0 = re[0];
+            const xm = re[m];
+            re[0] = x0 + xm;
+            im[0] = x0 - xm;
+            self.untangle(true, re, im);
+            if (m >= self.half.fused_min and self.half.bigStages() > 0) {
+                const w: F.Work = .{ .re = scratch[0..m], .im = scratch[m..][0..m] };
+                self.half.permutedIn(false, re[0..m], im[0..m], w);
+                self.half.bigInverseInterleaved(w, x);
+            } else {
+                self.half.inverse(re[0..m], im[0..m], scratch);
+                F.interleave(re[0..m], im[0..m], x);
+            }
+        }
+
+        fn untangle(self: *const Self, comptime inv: bool, re: []T, im: []T) void {
+            const m = self.n / 2;
+            const sgn: T = if (inv) -1 else 1;
+            var k: usize = 1;
+            while (k + lanes <= m / 2) : (k += lanes) {
+                const j = m - k - lanes + 1;
+                const ar: V = re[k..][0..lanes].*;
+                const ai: V = im[k..][0..lanes].*;
+                const br = rev(re[j..][0..lanes].*);
+                const bi = rev(im[j..][0..lanes].*);
+                const wr: V = self.wr[k..][0..lanes].*;
+                const wi: V = self.wi[k..][0..lanes].*;
+                const o = pair(V, inv, ar, ai, br, bi, wr, wi * @as(V, @splat(sgn)));
+                re[k..][0..lanes].* = o[0];
+                im[k..][0..lanes].* = o[1];
+                re[j..][0..lanes].* = rev(o[2]);
+                im[j..][0..lanes].* = rev(o[3]);
+            }
+            while (k <= m / 2) : (k += 1) {
+                const o = pair(T, inv, re[k], im[k], re[m - k], im[m - k], self.wr[k], sgn * self.wi[k]);
+                re[k] = o[0];
+                im[k] = o[1];
+                re[m - k] = o[2];
+                im[m - k] = o[3];
+            }
+        }
+
+        fn pair(comptime E: type, comptime inv: bool, ar: E, ai: E, br: E, bi: E, wr: E, wi: E) [4]E {
+            const er = ar + br;
+            const ei = ai - bi;
+            const dr = ar - br;
+            const di = ai + bi;
+            const half: E = if (E == T) 0.5 else @splat(@as(T, 0.5));
+            if (inv) {
+                const tr = di * wr + dr * wi;
+                const ti = di * wi - dr * wr;
+                return .{ er - tr, ei - ti, er + tr, -(ei + ti) };
+            }
+            const tr = (di * wr + dr * wi) * half;
+            const ti = (di * wi - dr * wr) * half;
+            return .{ er * half + tr, ei * half + ti, er * half - tr, -(ei * half - ti) };
+        }
+
+        fn rev(v: V) V {
+            const mask: M = comptime blk: {
+                var a: [lanes]i32 = undefined;
+                for (0..lanes) |i| a[i] = @intCast(lanes - 1 - i);
+                break :blk a;
+            };
+            return @shuffle(T, v, undefined, mask);
         }
     };
 }

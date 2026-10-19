@@ -171,6 +171,7 @@ fn Fftw(comptime T: type) type {
     return struct {
         const guru = @extern(*const fn (c_int, *const Iodim, c_int, ?*const Iodim, [*]T, [*]T, [*]T, [*]T, c_uint) callconv(.c) ?Plan, .{ .name = p ++ "plan_guru_split_dft" });
         const plan1d = @extern(*const fn (c_int, [*]T, [*]T, c_int, c_uint) callconv(.c) ?Plan, .{ .name = p ++ "plan_dft_1d" });
+        const r2c = @extern(*const fn (c_int, [*]T, [*]T, c_uint) callconv(.c) ?Plan, .{ .name = p ++ "plan_dft_r2c_1d" });
         const execute = @extern(*const fn (Plan) callconv(.c) void, .{ .name = p ++ "execute" });
         const destroy = @extern(*const fn (Plan) callconv(.c) void, .{ .name = p ++ "destroy_plan" });
 
@@ -237,6 +238,99 @@ fn fftRace(comptime T: type, gpa: std.mem.Allocator, io: std.Io, max_log2: u6) !
     }
 }
 
+fn zigRunR(comptime T: type) type {
+    return struct {
+        fn run(f: *const zc.Rfft(T), x: []const T, re: []T, im: []T, scratch: []T, reps: usize) void {
+            for (0..reps) |_| f.forward(x, re, im, scratch);
+        }
+    };
+}
+
+fn rfftRace(comptime T: type, gpa: std.mem.Allocator, io: std.Io, max_log2: u6) !void {
+    const W = Fftw(T);
+    std.debug.print("\nreal-input fft {s}, out of place, n/2+1 bins, vs FFTW r2c FFTW_MEASURE\n{s:>9} {s:>11} {s:>11} {s:>10} {s:>8}\n", .{ @typeName(T), "n", "zig ns", "fftw ns", "zig/fftw", "max err" });
+    var prng = std.Random.DefaultPrng.init(3);
+    var lg: u6 = 4;
+    while (lg <= max_log2) : (lg += 1) {
+        const n = @as(usize, 1) << lg;
+        const m = n / 2;
+        const rb = try gpa.alignedAlloc(T, .@"64", zc.Rfft(T).bufferLen(n));
+        defer gpa.free(rb);
+        const f = zc.Rfft(T).init(rb, n);
+        const x = try gpa.alignedAlloc(T, .@"64", n);
+        defer gpa.free(x);
+        const fx = try gpa.alignedAlloc(T, .@"64", n);
+        defer gpa.free(fx);
+        const fo = try gpa.alignedAlloc(T, .@"64", n + 2);
+        defer gpa.free(fo);
+        const re = try gpa.alignedAlloc(T, .@"64", m + 1);
+        defer gpa.free(re);
+        const im = try gpa.alignedAlloc(T, .@"64", m + 1);
+        defer gpa.free(im);
+        const scratch = try gpa.alignedAlloc(T, .@"64", n);
+        defer gpa.free(scratch);
+        const plan = W.r2c(@intCast(n), fx.ptr, fo.ptr, 0).?;
+        defer W.destroy(plan);
+        for (x) |*a| a.* = prng.random().float(T) * 2 - 1;
+        @memcpy(fx, x);
+        f.forward(x, re, im, scratch);
+        W.execute(plan);
+        var err: f64 = 0;
+        var peak: f64 = 0;
+        for (re, im, 0..) |a, b, k| {
+            err = @max(err, @abs(@as(f64, a) - fo[2 * k]), @abs(@as(f64, b) - fo[2 * k + 1]));
+            peak = @max(peak, @abs(@as(f64, fo[2 * k])), @abs(@as(f64, fo[2 * k + 1])));
+        }
+        const reps = @max(1, (@as(usize, 1) << 21) / n);
+        const tz = try clock(io, zigRunR(T).run, .{ &f, x, re, im, scratch, reps });
+        const tf = try clock(io, W.run, .{ plan, reps });
+        const per = @as(f64, @floatFromInt(reps));
+        const nz = @as(f64, @floatFromInt(tz)) / per;
+        const nf = @as(f64, @floatFromInt(tf)) / per;
+        std.debug.print("{d:>9} {d:>11.1} {d:>11.1} {d:>9.2}x {e:.1}\n", .{ n, nz, nf, nf / nz, err / peak });
+    }
+}
+
+fn cxRace(comptime T: type, gpa: std.mem.Allocator, io: std.Io) !void {
+    const C = zc.Fft(T).Complex;
+    std.debug.print("\ncomplex-typed api vs split api, complex fft {s}, in place\n{s:>9} {s:>11} {s:>11} {s:>14}\n", .{ @typeName(T), "n", "split ns", "complex ns", "complex/split" });
+    var lg: u6 = 4;
+    while (lg <= 20) : (lg += 1) {
+        const n = @as(usize, 1) << lg;
+        const fb = try gpa.alignedAlloc(T, .@"64", zc.Fft(T).bufferLen(n));
+        defer gpa.free(fb);
+        const f = zc.Fft(T).init(fb, n);
+        const z = try gpa.alignedAlloc(C, .@"64", n);
+        defer gpa.free(z);
+        const re = try gpa.alignedAlloc(T, .@"64", n);
+        defer gpa.free(re);
+        const im = try gpa.alignedAlloc(T, .@"64", n);
+        defer gpa.free(im);
+        const scratch = try gpa.alignedAlloc(T, .@"64", 4 * n);
+        defer gpa.free(scratch);
+        for (z, re, im, 0..) |*c, *a, *b, i| {
+            a.* = @floatFromInt(i % 5);
+            b.* = 0;
+            c.* = .{ .re = a.*, .im = 0 };
+        }
+        const reps = @max(1, (@as(usize, 1) << 21) / n);
+        const ts = try clock(io, zigRun(T).run, .{ &f, re, im, scratch[0 .. 2 * n], reps });
+        const tc = try clock(io, zigRunZ(T).run, .{ &f, z, scratch, reps });
+        const per = @as(f64, @floatFromInt(reps));
+        const ns = @as(f64, @floatFromInt(ts)) / per;
+        const nc = @as(f64, @floatFromInt(tc)) / per;
+        std.debug.print("{d:>9} {d:>11.1} {d:>11.1} {d:>13.2}x\n", .{ n, ns, nc, nc / ns });
+    }
+}
+
+fn zigRunZ(comptime T: type) type {
+    return struct {
+        fn run(f: *const zc.Fft(T), z: []zc.Fft(T).Complex, scratch: []T, reps: usize) void {
+            for (0..reps) |_| f.forwardComplex(z, scratch);
+        }
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     var dbg: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(dbg.deinit() == .ok);
@@ -248,6 +342,14 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "all") or std.mem.eql(u8, mode, "fft")) {
         try fftRace(f32, gpa, io, 22);
         try fftRace(f64, gpa, io, 21);
+    }
+    if (std.mem.eql(u8, mode, "all") or std.mem.eql(u8, mode, "cx")) {
+        try cxRace(f32, gpa, io);
+        try cxRace(f64, gpa, io);
+    }
+    if (std.mem.eql(u8, mode, "all") or std.mem.eql(u8, mode, "rfft")) {
+        try rfftRace(f32, gpa, io, 22);
+        try rfftRace(f64, gpa, io, 21);
     }
     if (!std.mem.eql(u8, mode, "all") and !std.mem.eql(u8, mode, "conv")) return;
 

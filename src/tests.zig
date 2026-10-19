@@ -478,3 +478,194 @@ test "static fft needs no memory and matches the dynamic plan" {
         }
     }
 }
+
+fn checkReal(comptime T: type, gpa: std.mem.Allocator, x: []const T) !void {
+    const n = x.len;
+    const m = n / 2;
+    const R = zc.Rfft(T);
+    const buf = try gpa.alignedAlloc(T, .@"64", R.bufferLen(n));
+    defer gpa.free(buf);
+    const f = R.init(buf, n);
+    const v = try gpa.alloc(T, 2 * (m + 1) + 2 * n);
+    defer gpa.free(v);
+    const re = v[0 .. m + 1];
+    const im = v[m + 1 .. 2 * (m + 1)];
+    const y = v[2 * (m + 1) ..][0..n];
+    const scratch = v[2 * (m + 1) + n ..][0..n];
+    @memset(re, std.math.nan(T));
+    @memset(im, std.math.nan(T));
+    @memset(scratch, std.math.nan(T));
+    const keep = try gpa.dupe(T, x);
+    defer gpa.free(keep);
+    f.forward(x, re, im, scratch);
+    try std.testing.expectEqualSlices(T, keep, x);
+    var peak: f64 = 1;
+    var want_r = try gpa.alloc(f64, m + 1);
+    defer gpa.free(want_r);
+    var want_i = try gpa.alloc(f64, m + 1);
+    defer gpa.free(want_i);
+    for (0..m + 1) |k| {
+        var sr: f64 = 0;
+        var si: f64 = 0;
+        for (x, 0..) |a, j| {
+            const ang = -2 * std.math.pi * @as(f64, @floatFromInt((j * k) % n)) / @as(f64, @floatFromInt(n));
+            sr += a * @cos(ang);
+            si += a * @sin(ang);
+        }
+        want_r[k] = sr;
+        want_i[k] = si;
+        peak = @max(peak, @abs(sr), @abs(si));
+    }
+    const eps: f64 = if (T == f32) 4e-7 else 1e-15;
+    const tol = peak * eps * @as(f64, @floatFromInt(std.math.log2_int(usize, n) + 2)) * 4;
+    for (0..m + 1) |k| {
+        const e = @max(@abs(@as(f64, re[k]) - want_r[k]), @abs(@as(f64, im[k]) - want_i[k]));
+        if (!(e <= tol)) {
+            std.debug.print("rfft {s} n={d} k={d} got=({d},{d}) want=({d},{d}) err={e} tol={e}\n", .{ @typeName(T), n, k, re[k], im[k], want_r[k], want_i[k], e, tol });
+            return error.TestExpectedApproxEq;
+        }
+    }
+    @memset(y, std.math.nan(T));
+    f.inverse(re, im, y, scratch);
+    const nf: f64 = @floatFromInt(n);
+    for (y, x) |a, b| {
+        if (!(@abs(@as(f64, a) / nf - b) <= tol / nf * 4 + eps * 8)) {
+            std.debug.print("irfft {s} n={d} got={d} want={d}\n", .{ @typeName(T), n, a / nf, b });
+            return error.TestExpectedApproxEq;
+        }
+    }
+}
+
+test "real fft matches naive dft and round trips for every power of two up to 4096" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(91);
+    const r = prng.random();
+    inline for (.{ f32, f64 }) |T| {
+        var n: usize = 2;
+        while (n <= 4096) : (n *= 2) {
+            const x = try gpa.alloc(T, n);
+            defer gpa.free(x);
+            fill(T, r, x);
+            try checkReal(T, gpa, x);
+            @memset(x, 0);
+            x[0] = 1;
+            try checkReal(T, gpa, x);
+            @memset(x, 1);
+            try checkReal(T, gpa, x);
+            for (x, 0..) |*v, i| v.* = if (i % 2 == 0) 1 else -1;
+            try checkReal(T, gpa, x);
+        }
+    }
+}
+
+test "real fft agrees with the complex fft on real input up to 2^20" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(92);
+    const r = prng.random();
+    inline for (.{ f32, f64 }) |T| {
+        var n: usize = 4;
+        while (n <= 1 << 20) : (n *= 4) {
+            const m = n / 2;
+            const rb = try gpa.alignedAlloc(T, .@"64", zc.Rfft(T).bufferLen(n));
+            defer gpa.free(rb);
+            const rf = zc.Rfft(T).init(rb, n);
+            const cb = try gpa.alignedAlloc(T, .@"64", zc.Fft(T).bufferLen(n));
+            defer gpa.free(cb);
+            const cf = zc.Fft(T).init(cb, n);
+            const v = try gpa.alloc(T, 7 * n + 2);
+            defer gpa.free(v);
+            const x = v[0..n];
+            const cr = v[n .. 2 * n];
+            const ci = v[2 * n .. 3 * n];
+            const scratch = v[3 * n .. 5 * n];
+            const re = v[5 * n ..][0 .. m + 1];
+            const im = v[5 * n + m + 1 ..][0 .. m + 1];
+            const y = v[6 * n + 2 ..][0..n];
+            fill(T, r, x);
+            @memcpy(cr, x);
+            @memset(ci, 0);
+            cf.forward(cr, ci, scratch);
+            rf.forward(x, re, im, scratch);
+            var peak: f64 = 1;
+            for (cr[0 .. m + 1], ci[0 .. m + 1]) |a, b| peak = @max(peak, @abs(@as(f64, a)), @abs(@as(f64, b)));
+            const eps: f64 = if (T == f32) 2e-6 else 1e-14;
+            for (re, im, cr[0 .. m + 1], ci[0 .. m + 1]) |a, b, c, d| {
+                try std.testing.expect(@abs(@as(f64, a) - c) <= peak * eps and @abs(@as(f64, b) - d) <= peak * eps);
+            }
+            rf.inverse(re, im, y, scratch);
+            const nf: f64 = @floatFromInt(n);
+            for (y, x) |a, b| try std.testing.expect(@abs(@as(f64, a) / nf - b) <= eps * 4);
+        }
+    }
+}
+
+test "complex-typed api is bit-identical to the split api" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(93);
+    const r = prng.random();
+    inline for (.{ f32, f64 }) |T| {
+        const C = std.math.Complex(T);
+        var n: usize = 2;
+        while (n <= 1 << 18) : (n *= 2) {
+            const fb = try gpa.alignedAlloc(T, .@"64", zc.Fft(T).bufferLen(n));
+            defer gpa.free(fb);
+            const f = zc.Fft(T).init(fb, n);
+            const zbuf = try gpa.alloc(C, n + 1);
+            defer gpa.free(zbuf);
+            const z = zbuf[1..];
+            const v = try gpa.alloc(T, 6 * n);
+            defer gpa.free(v);
+            const re = v[0..n];
+            const im = v[n .. 2 * n];
+            const scratch = v[2 * n ..];
+            fill(T, r, re);
+            fill(T, r, im);
+            for (z, re, im) |*c, a, b| c.* = .{ .re = a, .im = b };
+            @memset(scratch, std.math.nan(T));
+            f.forwardComplex(z, scratch);
+            f.forward(re, im, scratch[0 .. 2 * n]);
+            for (z, re, im) |c, a, b| {
+                try std.testing.expectEqual(a, c.re);
+                try std.testing.expectEqual(b, c.im);
+            }
+            f.inverseComplex(z, scratch);
+            f.inverse(re, im, scratch[0 .. 2 * n]);
+            for (z, re, im) |c, a, b| {
+                try std.testing.expectEqual(a, c.re);
+                try std.testing.expectEqual(b, c.im);
+            }
+        }
+        n = 2;
+        while (n <= 1 << 16) : (n *= 2) {
+            const m = n / 2;
+            const rb = try gpa.alignedAlloc(T, .@"64", zc.Rfft(T).bufferLen(n));
+            defer gpa.free(rb);
+            const rf = zc.Rfft(T).init(rb, n);
+            const x = try gpa.alloc(T, n);
+            defer gpa.free(x);
+            const y = try gpa.alloc(T, n);
+            defer gpa.free(y);
+            const out = try gpa.alloc(C, m + 1);
+            defer gpa.free(out);
+            const v = try gpa.alloc(T, 2 * (m + 1) + 2 * n + 2);
+            defer gpa.free(v);
+            const re = v[0 .. m + 1];
+            const im = v[m + 1 .. 2 * (m + 1)];
+            const scratch = v[2 * (m + 1) ..];
+            fill(T, r, x);
+            rf.forwardComplex(x, out, scratch);
+            rf.forward(x, re, im, scratch[0..n]);
+            for (out, re, im) |c, a, b| {
+                try std.testing.expectEqual(a, c.re);
+                try std.testing.expectEqual(b, c.im);
+            }
+            const keep = try gpa.dupe(C, out);
+            defer gpa.free(keep);
+            rf.inverseComplex(out, y, scratch);
+            try std.testing.expectEqualSlices(C, keep, out);
+            const nf: f64 = @floatFromInt(n);
+            const eps: f64 = if (T == f32) 1e-5 else 1e-13;
+            for (y, x) |a, b| try std.testing.expect(@abs(@as(f64, a) / nf - b) <= eps);
+        }
+    }
+}

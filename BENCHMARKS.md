@@ -102,6 +102,122 @@ equal to input length. That length makes FFTW's one-shot transform exactly `2^22
   codelets. Things tried here that did not close the gap: radix-8 passes (register spills),
   an interleaved-layout Stockham core, keeping passes L1-resident, smaller cache blocks.
 
+## Real-input FFT
+
+zconv: `Rfft(T).forward`, `x` (n reals) to `re`, `im` (n/2 + 1 bins each), out of place.
+FFTW: `fftw_plan_dft_r2c_1d`, out of place, `FFTW_MEASURE`, n/2 + 1 interleaved complex outputs.
+Each row is the mean of two complete runs. The two runs agreed to about 3% for f64, but
+differed by up to 25% in a few small f32 rows (64 to 8192 points, in both libraries at
+once), so ratios there are good to about plus or minus 15%.
+
+### Real FFT, f32
+
+| n | zconv ns | FFTW ns | speed vs FFTW | max err |
+|---:|---:|---:|---:|---:|
+| 16 | 18.5 | 11.9 | 0.65x | 1.3e-07 |
+| 32 | 31.5 | 29.0 | 0.92x | 8.7e-08 |
+| 64 | 48.3 | 42.6 | 0.88x | 7.9e-08 |
+| 128 | 72.8 | 63.4 | 0.87x | 1.7e-07 |
+| 256 | 138.2 | 115.3 | 0.83x | 1.3e-07 |
+| 512 | 241.0 | 218.3 | 0.91x | 1.8e-07 |
+| 1024 | 463.4 | 388.6 | 0.84x | 1.6e-07 |
+| 2048 | 878.4 | 852.0 | 0.97x | 2.0e-07 |
+| 4096 | 2193 | 2021 | 0.92x | 2.1e-07 |
+| 8192 | 4778 | 4385 | 0.92x | 2.0e-07 |
+| 16384 | 12256 | 12396 | 1.01x | 2.3e-07 |
+| 32768 | 24945 | 26707 | 1.07x | 3.2e-07 |
+| 65536 | 54924 | 60000 | 1.09x | 2.8e-07 |
+| 131072 | 120036 | 144789 | 1.21x | 2.8e-07 |
+| 262144 | 265502 | 345449 | 1.30x | 2.0e-07 |
+| 524288 | 597724 | 734222 | 1.23x | 2.6e-07 |
+| 1048576 | 1473492 | 1909670 | 1.30x | 2.7e-07 |
+| 2097152 | 3897180 | 4373550 | 1.12x | 2.6e-07 |
+| 4194304 | 9971563 | 10739204 | 1.08x | 2.7e-07 |
+
+### Real FFT, f64
+
+| n | zconv ns | FFTW ns | speed vs FFTW | max err |
+|---:|---:|---:|---:|---:|
+| 16 | 32.0 | 18.1 | 0.57x | 1.3e-16 |
+| 32 | 40.6 | 33.0 | 0.81x | 2.1e-16 |
+| 64 | 59.8 | 51.7 | 0.86x | 2.2e-16 |
+| 128 | 107.2 | 86.1 | 0.80x | 3.7e-16 |
+| 256 | 182.6 | 153.2 | 0.84x | 3.1e-16 |
+| 512 | 392.4 | 315.0 | 0.80x | 5.9e-16 |
+| 1024 | 828.8 | 648.0 | 0.78x | 4.2e-16 |
+| 2048 | 2092 | 1556 | 0.74x | 4.8e-16 |
+| 4096 | 4648 | 3553 | 0.76x | 5.8e-16 |
+| 8192 | 12186 | 8851 | 0.73x | 6.6e-16 |
+| 16384 | 25600 | 19370 | 0.76x | 6.4e-16 |
+| 32768 | 56541 | 41656 | 0.74x | 6.9e-16 |
+| 65536 | 121078 | 103230 | 0.85x | 6.9e-16 |
+| 131072 | 276559 | 264188 | 0.96x | 7.8e-16 |
+| 262144 | 597276 | 540484 | 0.90x | 7.8e-16 |
+| 524288 | 1461779 | 1338067 | 0.92x | 8.3e-16 |
+| 1048576 | 3764652 | 3570978 | 0.95x | 7.9e-16 |
+| 2097152 | 9350931 | 8857788 | 0.95x | 9.8e-16 |
+
+### What this says
+
+- f32: faster than FFTW from 16384 points up, by 1.08x to 1.30x. Below that it is behind,
+  between 0.65x and 1.07x (worst at 16 points).
+- f64: behind FFTW at every size, between 0.57x and 0.96x. The gap is smallest for large n.
+- The real FFT is built on the complex one, so it inherits the same pattern: the cache
+  blocking pays off for large sizes, FFTW's generated codelets win in the middle.
+
+## Complex-typed API
+
+`Fft(T).forwardComplex` on a `[]Complex` against `Fft(T).forward` on split arrays, same
+plan, same data, in place. The two give identical results. Single run per row.
+
+### f32
+
+| n | split ns | complex ns | complex / split |
+|---:|---:|---:|---:|
+| 16 | 15.1 | 23.4 | 1.55x |
+| 32 | 26.1 | 37.9 | 1.45x |
+| 64 | 38.9 | 59.3 | 1.52x |
+| 128 | 84.9 | 126.1 | 1.49x |
+| 256 | 146.3 | 227.9 | 1.56x |
+| 512 | 292.0 | 409.1 | 1.40x |
+| 1024 | 607.6 | 836.2 | 1.38x |
+| 2048 | 1336 | 1838 | 1.38x |
+| 4096 | 3784 | 3926 | 1.04x |
+| 8192 | 10147 | 8443 | 0.83x |
+| 16384 | 20891 | 17773 | 0.85x |
+| 32768 | 45841 | 39043 | 0.85x |
+| 65536 | 105279 | 86148 | 0.82x |
+| 131072 | 245707 | 209687 | 0.85x |
+| 262144 | 545126 | 462568 | 0.85x |
+| 524288 | 1272532 | 1059787 | 0.83x |
+| 1048576 | 3472347 | 3190696 | 0.92x |
+
+### f64
+
+| n | split ns | complex ns | complex / split |
+|---:|---:|---:|---:|
+| 16 | 15.3 | 28.3 | 1.85x |
+| 32 | 27.6 | 44.2 | 1.60x |
+| 64 | 55.3 | 83.5 | 1.51x |
+| 128 | 120.4 | 145.3 | 1.21x |
+| 256 | 265.3 | 324.6 | 1.22x |
+| 512 | 573.1 | 701.9 | 1.22x |
+| 1024 | 1272 | 1535 | 1.21x |
+| 2048 | 3878 | 3707 | 0.96x |
+| 4096 | 10251 | 8361 | 0.82x |
+| 8192 | 21497 | 17242 | 0.80x |
+| 16384 | 49646 | 39740 | 0.80x |
+| 32768 | 103629 | 82257 | 0.79x |
+| 65536 | 244154 | 211626 | 0.87x |
+| 131072 | 532253 | 469440 | 0.88x |
+| 262144 | 1194827 | 1123167 | 0.94x |
+| 524288 | 3329518 | 3268214 | 0.98x |
+| 1048576 | 8577282 | 8423588 | 0.98x |
+
+Below about 2048 points the conversion between layouts costs 20% to 85% extra. From 4096
+points up it is folded into the first and last pass and the typed API is equal or up to
+about 20% faster, since those passes read and write interleaved data directly.
+
 ## Convolution, f32, one thread
 
 | taps | block | radixz ms | FFTW one-shot ms | FFTW overlap-save ms | vs one-shot | vs overlap-save | max err |
@@ -145,7 +261,9 @@ efficiency cores, and with large filters each worker's block no longer fits in i
 
 ```sh
 zig build bench -Doptimize=ReleaseFast           # everything
-zig build bench -Doptimize=ReleaseFast -- fft    # FFT tables only
+zig build bench -Doptimize=ReleaseFast -- fft    # complex FFT tables only
+zig build bench -Doptimize=ReleaseFast -- rfft   # real-input FFT tables only
+zig build bench -Doptimize=ReleaseFast -- cx     # complex-typed API vs split API
 zig build bench -Doptimize=ReleaseFast -- conv   # convolution tables only
 ```
 

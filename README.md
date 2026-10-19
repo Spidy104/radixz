@@ -1,9 +1,10 @@
 # radixz
 
-Power-of-two complex FFT and FIR convolution in Zig.
+Power-of-two FFT (complex and real) and FIR convolution in Zig.
 
 - `Fft(T)`: in-place complex FFT, natural order, `f32` or `f64`
-- `StaticFft(T, n)`: same, size fixed at compile time, needs no buffers at all
+- `Rfft(T)`: FFT of real input (`n` samples to `n / 2 + 1` bins), about half the cost
+- `StaticFft(T, n)`: complex FFT with the size fixed at compile time, needs no buffers at all
 - `Conv(T)`: overlap-save FIR filter, optionally multi-threaded
 
 The library never allocates. You hand it memory, it uses only that.
