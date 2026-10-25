@@ -139,6 +139,7 @@ pub fn Fft(comptime T: type) type {
         }
 
         const rev_span: [span]usize = blk: {
+            @setEvalBranchQuota(64 * span + 1000);
             var t: [span]usize = undefined;
             for (&t, 0..) |*v, i| v.* = @bitReverse(@as(std.math.IntFittingRange(0, span - 1), @intCast(i)));
             break :blk t;
